@@ -6,6 +6,7 @@ import com.azure.security.keyvault.keys.KeyClient;
 import com.azure.security.keyvault.keys.cryptography.CryptographyClient;
 import com.azure.security.keyvault.keys.cryptography.models.DecryptParameters;
 import com.azure.security.keyvault.keys.cryptography.models.EncryptParameters;
+import com.azure.security.keyvault.keys.cryptography.models.EncryptResult;
 import com.azure.security.keyvault.keys.cryptography.models.EncryptionAlgorithm;
 import com.azure.security.keyvault.keys.cryptography.models.KeyWrapAlgorithm;
 import com.azure.security.keyvault.keys.cryptography.models.SignatureAlgorithm;
@@ -13,12 +14,29 @@ import com.azure.security.keyvault.keys.models.CreateEcKeyOptions;
 import com.azure.security.keyvault.keys.models.CreateOctKeyOptions;
 import com.azure.security.keyvault.keys.models.CreateRsaKeyOptions;
 import com.azure.security.keyvault.keys.models.DeletedKey;
+import com.azure.security.keyvault.keys.models.ImportKeyOptions;
+import com.azure.security.keyvault.keys.models.JsonWebKey;
 import com.azure.security.keyvault.keys.models.KeyCurveName;
+import com.azure.security.keyvault.keys.models.KeyOperation;
 import com.azure.security.keyvault.keys.models.KeyProperties;
 import com.azure.security.keyvault.keys.models.KeyRotationPolicy;
+import com.azure.security.keyvault.keys.models.KeyType;
 import com.azure.security.keyvault.keys.models.KeyVaultKey;
 import org.junit.jupiter.api.*;
 
+import javax.crypto.Cipher;
+import javax.crypto.spec.GCMParameterSpec;
+import javax.crypto.spec.SecretKeySpec;
+import java.math.BigInteger;
+import java.nio.charset.StandardCharsets;
+import java.security.KeyFactory;
+import java.security.KeyPair;
+import java.security.KeyPairGenerator;
+import java.security.PublicKey;
+import java.security.SecureRandom;
+import java.security.interfaces.RSAPublicKey;
+import java.security.spec.RSAPublicKeySpec;
+import java.util.Base64;
 import java.util.List;
 import java.util.UUID;
 
@@ -190,6 +208,94 @@ class KeyVaultKeysCompatibilityTest {
     // -------------------------------------------------------------------------
     // Crypto operations
     // -------------------------------------------------------------------------
+
+    // -------------------------------------------------------------------------
+    // Bring your own key (key_hsm transfer blob)
+    // -------------------------------------------------------------------------
+
+    @Test
+    @DisplayName("BYOK import of an RSA key decrypts what its public key encrypted")
+    void byokImportRsaKey() throws Exception {
+        KeyVaultKey kek = createKek(client);
+        KeyPairGenerator generator = KeyPairGenerator.getInstance("RSA");
+        generator.initialize(2048);
+        KeyPair target = generator.generateKeyPair();
+        String n = name("byok-rsa");
+
+        KeyVaultKey imported = client.importKey(new ImportKeyOptions(n, new JsonWebKey()
+                .setKeyType(KeyType.RSA_HSM)
+                .setKeyOps(List.of(KeyOperation.ENCRYPT, KeyOperation.DECRYPT))
+                .setT(transferBlob(kek, target.getPrivate().getEncoded()))));
+        assertEquals(KeyType.RSA_HSM, imported.getKeyType());
+        assertEquals(((RSAPublicKey) target.getPublic()).getModulus(), new BigInteger(1, imported.getKey().getN()));
+
+        byte[] plaintext = "hello-byok".getBytes(StandardCharsets.UTF_8);
+        Cipher oaep = Cipher.getInstance("RSA/ECB/OAEPWithSHA-1AndMGF1Padding");
+        oaep.init(Cipher.ENCRYPT_MODE, target.getPublic());
+        byte[] decrypted = crypto(imported)
+                .decrypt(DecryptParameters.createRsaOaepParameters(oaep.doFinal(plaintext)), Context.NONE)
+                .getPlainText();
+        assertArrayEquals(plaintext, decrypted);
+        client.beginDeleteKey(n);
+        client.beginDeleteKey(kek.getName());
+    }
+
+    @Test
+    @DisplayName("BYOK import of an AES key into a managed HSM")
+    void byokImportAesKeyIntoManagedHsm() throws Exception {
+        KeyClient hsm = EmulatorConfig.buildManagedHsmKeyClient();
+        KeyVaultKey kek = createKek(hsm);
+        byte[] aes = new byte[32];
+        new SecureRandom().nextBytes(aes);
+        String n = name("byok-aes");
+
+        KeyVaultKey imported = hsm.importKey(new ImportKeyOptions(n, new JsonWebKey()
+                .setKeyType(KeyType.OCT_HSM)
+                .setKeyOps(List.of(KeyOperation.ENCRYPT, KeyOperation.DECRYPT))
+                .setT(transferBlob(kek, aes))));
+        assertEquals(KeyType.OCT_HSM, imported.getKeyType());
+        // Symmetric key material is never released in a Key Vault response.
+        assertNull(imported.getKey().getK());
+
+        CryptographyClient c = EmulatorConfig.buildManagedHsmCryptographyClient(n, imported.getProperties().getVersion());
+        byte[] plaintext = "hello-byok-aes".getBytes(StandardCharsets.UTF_8);
+        EncryptResult encrypted = c.encrypt(EncryptParameters.createA256GcmParameters(plaintext), Context.NONE);
+        Cipher gcm = Cipher.getInstance("AES/GCM/NoPadding");
+        gcm.init(Cipher.DECRYPT_MODE, new SecretKeySpec(aes, "AES"), new GCMParameterSpec(128, encrypted.getIv()));
+        gcm.update(encrypted.getCipherText());
+        assertArrayEquals(plaintext, gcm.doFinal(encrypted.getAuthenticationTag()));
+        hsm.beginDeleteKey(n);
+        hsm.beginDeleteKey(kek.getName());
+    }
+
+    private KeyVaultKey createKek(KeyClient keys) {
+        return keys.createRsaKey(new CreateRsaKeyOptions(name("kek"))
+                .setKeySize(2048)
+                .setHardwareProtected(true)
+                .setKeyOperations(KeyOperation.IMPORT));
+    }
+
+    /** A CKM_RSA_AES_KEY_WRAP transfer blob, built the way an HSM vendor's BYOK tool builds it. */
+    private static byte[] transferBlob(KeyVaultKey kek, byte[] targetKey) throws Exception {
+        PublicKey kekPublic = KeyFactory.getInstance("RSA").generatePublic(new RSAPublicKeySpec(
+                new BigInteger(1, kek.getKey().getN()), new BigInteger(1, kek.getKey().getE())));
+        byte[] aes = new byte[32];
+        new SecureRandom().nextBytes(aes);
+        Cipher oaep = Cipher.getInstance("RSA/ECB/OAEPWithSHA-1AndMGF1Padding");
+        oaep.init(Cipher.ENCRYPT_MODE, kekPublic);
+        byte[] wrappedAes = oaep.doFinal(aes);
+        Cipher kwp = Cipher.getInstance("AES/KWP/NoPadding");
+        kwp.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(aes, "AES"));
+        byte[] wrappedTarget = kwp.doFinal(targetKey);
+        byte[] ciphertext = new byte[wrappedAes.length + wrappedTarget.length];
+        System.arraycopy(wrappedAes, 0, ciphertext, 0, wrappedAes.length);
+        System.arraycopy(wrappedTarget, 0, ciphertext, wrappedAes.length, wrappedTarget.length);
+        String json = "{\"schema_version\":\"1.0.0\",\"header\":{\"kid\":\"" + kek.getId()
+                + "\",\"alg\":\"dir\",\"enc\":\"CKM_RSA_AES_KEY_WRAP\"},\"ciphertext\":\""
+                + Base64.getUrlEncoder().withoutPadding().encodeToString(ciphertext)
+                + "\",\"generator\":\"floci-az compatibility tests\"}";
+        return json.getBytes(StandardCharsets.UTF_8);
+    }
 
     @Test
     @DisplayName("RSA-OAEP-256 encrypt/decrypt round-trip")

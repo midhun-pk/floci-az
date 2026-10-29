@@ -82,6 +82,9 @@ final class KeyVaultKeys {
         @SuppressWarnings("unchecked")
         Map<String, Object> supplied = body.get("key") instanceof Map<?, ?> m
                 ? (Map<String, Object>) m : new LinkedHashMap<>();
+        if (supplied.containsKey("key_hsm")) {
+            return importTransferBlob(req, account, name, body, supplied, hsm);
+        }
 
         Map<String, Object> jwk;
         try {
@@ -93,6 +96,74 @@ final class KeyVaultKeys {
         jwk.put("tags", stringMap(body.get("tags")));
 
         return storeNewKey(req, account, name, jwk, body, hsm);
+    }
+
+    /**
+     * BYOK: imports a key whose material arrives in a {@code key_hsm} transfer blob, protected by a key
+     * exchange key (an {@code RSA-HSM} key with the {@code import} operation) in this same vault.
+     */
+    private Response importTransferBlob(AzureRequest req, String account, String name,
+            Map<String, Object> body, Map<String, Object> supplied, boolean hsm) {
+        if (!(supplied.get("kty") instanceof String kty) || kty.isBlank()) {
+            return kvError(400, "BadParameter", "key type (kty) is required");
+        }
+        if (!kty.equals("RSA-HSM") && !kty.equals("EC-HSM") && !kty.equals("oct-HSM")) {
+            return kvError(400, "BadParameter",
+                    "A key transfer blob imports an RSA-HSM, EC-HSM or oct-HSM key, not " + kty);
+        }
+        if (kty.equals("oct-HSM") && !hsm) {
+            return kvError(400, "BadParameter", "oct-HSM keys can only be imported into a Managed HSM");
+        }
+        @SuppressWarnings("unchecked")
+        List<String> keyOps = supplied.get("key_ops") instanceof List<?> l
+                ? (List<String>) l : KeyVaultCrypto.defaultKeyOps(KeyVaultCrypto.baseKty(kty));
+        String crv = supplied.get("crv") instanceof String s ? s : null;
+
+        Map<String, Object> jwk;
+        try {
+            KeyVaultByok.TransferBlob blob = KeyVaultByok.parseTransferBlob(String.valueOf(supplied.get("key_hsm")));
+            String kekPath = keyExchangeKeyPath(blob.kid(), account, hsm);
+            if (kekPath == null) {
+                return keyNotFound(blob.kid());
+            }
+            int slash = kekPath.indexOf('/');
+            String kekName = slash < 0 ? kekPath : kekPath.substring(0, slash);
+            String kekVersion = slash < 0 ? "" : kekPath.substring(slash + 1);
+            StoredObject kekObj = resolveKeyForCrypto(account, kekName, kekVersion, hsm);
+            if (kekObj == null) {
+                return keyNotFound(blob.kid());
+            }
+            Response unusable = unusableKey(kekObj, kekName);
+            if (unusable != null) {
+                return unusable;
+            }
+            Map<String, Object> kek = parseStoredData(kekObj);
+            if (!"RSA-HSM".equals(kek.get("kty")) || !permits(kek.get("key_ops"), "import")) {
+                return kvError(400, "BadParameter", "The key exchange key " + blob.kid()
+                        + " must be an RSA-HSM key with the import operation.");
+            }
+            byte[] targetKey = KeyVaultByok.unwrap(kek, blob.ciphertext());
+            jwk = KeyVaultByok.targetJwk(kty, crv, keyOps, targetKey);
+        } catch (KeyVaultCrypto.CryptoException e) {
+            return kvError(400, "BadParameter", e.getMessage());
+        }
+        jwk.put("hsm", true);
+        jwk.put("tags", stringMap(body.get("tags")));
+
+        return storeNewKey(req, account, name, jwk, body, hsm);
+    }
+
+    /** {@code name} or {@code name/version} of a key identifier in this vault, or null for any other kid. */
+    private String keyExchangeKeyPath(String kid, String account, boolean hsm) {
+        String prefix = vaultHost(account, hsm) + "/keys/";
+        if (!kid.regionMatches(true, 0, prefix, 0, prefix.length())) {
+            return null;
+        }
+        String path = kid.substring(prefix.length());
+        if (path.endsWith("/")) {
+            path = path.substring(0, path.length() - 1);
+        }
+        return path.isEmpty() || path.chars().filter(c -> c == '/').count() > 1 ? null : path;
     }
 
     private Response storeNewKey(AzureRequest req, String account, String name,
@@ -584,17 +655,9 @@ final class KeyVaultKeys {
         if (keyObj == null) {
             return keyNotFound(name + (version != null && !version.isEmpty() ? "/" + version : ""));
         }
-        if (!"true".equals(keyObj.metadata().getOrDefault("enabled", "true"))) {
-            return kvError(403, "Forbidden", "The key " + name + " is disabled.");
-        }
-        long nowEpoch = Instant.now().getEpochSecond();
-        Long exp = parseLongNullable(keyObj.metadata().get("exp"));
-        if (exp != null && nowEpoch > exp) {
-            return kvError(403, "Forbidden", "The key " + name + " is expired.");
-        }
-        Long nbf = parseLongNullable(keyObj.metadata().get("nbf"));
-        if (nbf != null && nowEpoch < nbf) {
-            return kvError(403, "Forbidden", "The key " + name + " is not yet valid.");
+        Response unusable = unusableKey(keyObj, name);
+        if (unusable != null) {
+            return unusable;
         }
 
         Map<String, Object> data = parseStoredData(keyObj);
@@ -686,6 +749,23 @@ final class KeyVaultKeys {
         } catch (KeyVaultCrypto.CryptoException e) {
             return kvError(400, "BadParameter", e.getMessage());
         }
+    }
+
+    /** A 403 for a disabled, expired or not-yet-valid key, or null when the key can be used now. */
+    private Response unusableKey(StoredObject keyObj, String name) {
+        if (!"true".equals(keyObj.metadata().getOrDefault("enabled", "true"))) {
+            return kvError(403, "Forbidden", "The key " + name + " is disabled.");
+        }
+        long nowEpoch = Instant.now().getEpochSecond();
+        Long exp = parseLongNullable(keyObj.metadata().get("exp"));
+        if (exp != null && nowEpoch > exp) {
+            return kvError(403, "Forbidden", "The key " + name + " is expired.");
+        }
+        Long nbf = parseLongNullable(keyObj.metadata().get("nbf"));
+        if (nbf != null && nowEpoch < nbf) {
+            return kvError(403, "Forbidden", "The key " + name + " is not yet valid.");
+        }
+        return null;
     }
 
     private StoredObject resolveKeyForCrypto(String account, String name, String version, boolean hsm) {

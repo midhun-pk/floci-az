@@ -109,7 +109,7 @@ final class KeyVaultCrypto {
         return new BigInteger(1, b64UrlDecode(s));
     }
 
-    private static byte[] fixedLengthUnsigned(BigInteger value, int len) {
+    static byte[] fixedLengthUnsigned(BigInteger value, int len) {
         byte[] raw = toUnsignedBytes(value);
         if (raw.length > len) {
             throw new CryptoException("JWK field does not fit curve field size");
@@ -382,7 +382,7 @@ final class KeyVaultCrypto {
         return new SecretKeySpec(b64UrlDecode((String) jwk.get("k")), "AES");
     }
 
-    private static ECParameterSpec ecParams(String crv) {
+    static ECParameterSpec ecParams(String crv) {
         try {
             AlgorithmParameters ap = AlgorithmParameters.getInstance("EC");
             ap.init(new ECGenParameterSpec(curveToStd(crv)));

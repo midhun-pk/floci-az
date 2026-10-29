@@ -1,6 +1,8 @@
 """
 Compatibility tests for Azure Key Vault Keys and Cryptography.
 """
+import base64
+import json
 import os
 import time
 import uuid
@@ -8,14 +10,17 @@ import hashlib
 
 import pytest
 from azure.core.credentials import AccessToken, TokenCredential
-from azure.core.exceptions import ResourceNotFoundError
+from azure.core.exceptions import HttpResponseError, ResourceNotFoundError
 from azure.core.pipeline.transport import RequestsTransport
+from azure.keyvault.keys import JsonWebKey, KeyOperation, KeyType
 from azure.keyvault.keys.crypto import (
     CryptographyClient,
     EncryptionAlgorithm,
     KeyWrapAlgorithm,
     SignatureAlgorithm,
 )
+from cryptography.hazmat.primitives import hashes, keywrap, serialization
+from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
 
 
 def unique(prefix="key"):
@@ -263,3 +268,108 @@ def test_managed_hsm_basic_crud(hsm_keys_client):
     assert name in listed
 
     hsm_keys_client.begin_delete_key(name).result()
+
+
+# ---------------------------------------------------------------------------
+# Bring your own key (key_hsm transfer blob)
+# ---------------------------------------------------------------------------
+
+def _create_kek(client, name):
+    return client.create_rsa_key(
+        name, size=2048, hardware_protected=True, key_operations=[KeyOperation.import_key]
+    )
+
+
+def _transfer_blob(kek, target_key):
+    """A CKM_RSA_AES_KEY_WRAP transfer blob, built the way an HSM vendor's BYOK tool builds it."""
+    kek_public = rsa.RSAPublicNumbers(
+        int.from_bytes(kek.key.e, "big"), int.from_bytes(kek.key.n, "big")
+    ).public_key()
+    aes_key = os.urandom(32)
+    wrapped_aes_key = kek_public.encrypt(
+        aes_key,
+        padding.OAEP(mgf=padding.MGF1(hashes.SHA1()), algorithm=hashes.SHA1(), label=None),
+    )
+    ciphertext = wrapped_aes_key + keywrap.aes_key_wrap_with_padding(aes_key, target_key)
+    return json.dumps({
+        "schema_version": "1.0.0",
+        "header": {"kid": kek.id, "alg": "dir", "enc": "CKM_RSA_AES_KEY_WRAP"},
+        "ciphertext": base64.urlsafe_b64encode(ciphertext).rstrip(b"=").decode(),
+        "generator": "floci-az compatibility tests",
+    }).encode()
+
+
+def _pkcs8(private_key):
+    return private_key.private_bytes(
+        serialization.Encoding.DER,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    )
+
+
+def test_byok_import_rsa_key(keys_client):
+    kek = _create_kek(keys_client, unique("kek"))
+    target = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = unique("byok-rsa")
+
+    imported = keys_client.import_key(
+        name,
+        JsonWebKey(kty=KeyType.rsa_hsm, key_ops=["encrypt", "decrypt"],
+                   t=_transfer_blob(kek, _pkcs8(target))),
+    )
+    assert imported.key.kty == "RSA-HSM"
+    assert int.from_bytes(imported.key.n, "big") == target.public_key().public_numbers().n
+
+    ciphertext = target.public_key().encrypt(
+        b"byok-plaintext",
+        padding.OAEP(mgf=padding.MGF1(hashes.SHA1()), algorithm=hashes.SHA1(), label=None),
+    )
+    decrypted = _crypto(name, imported.properties.version).decrypt(EncryptionAlgorithm.rsa_oaep, ciphertext)
+    assert decrypted.plaintext == b"byok-plaintext"
+    keys_client.begin_delete_key(name).result()
+    keys_client.begin_delete_key(kek.name).result()
+
+
+def test_byok_import_ec_key(keys_client):
+    kek = _create_kek(keys_client, unique("kek"))
+    target = ec.generate_private_key(ec.SECP256R1())
+    name = unique("byok-ec")
+
+    imported = keys_client.import_key(
+        name,
+        JsonWebKey(kty=KeyType.ec_hsm, crv="P-256", key_ops=["sign", "verify"],
+                   t=_transfer_blob(kek, _pkcs8(target))),
+    )
+    public_numbers = target.public_key().public_numbers()
+    assert imported.key.kty == "EC-HSM"
+    assert int.from_bytes(imported.key.x, "big") == public_numbers.x
+    assert int.from_bytes(imported.key.y, "big") == public_numbers.y
+    keys_client.begin_delete_key(name).result()
+    keys_client.begin_delete_key(kek.name).result()
+
+
+def test_byok_import_aes_key_into_managed_hsm(hsm_keys_client):
+    kek = _create_kek(hsm_keys_client, unique("kek"))
+    name = unique("byok-aes")
+
+    imported = hsm_keys_client.import_key(
+        name,
+        JsonWebKey(kty=KeyType.oct_hsm, key_ops=["encrypt", "decrypt"],
+                   t=_transfer_blob(kek, os.urandom(32))),
+    )
+    assert imported.key.kty == "oct-HSM"
+    # Symmetric key material is never released in a Key Vault response.
+    assert imported.key.k is None
+    hsm_keys_client.begin_delete_key(name).result()
+    hsm_keys_client.begin_delete_key(kek.name).result()
+
+
+def test_byok_import_aes_key_into_vault_is_rejected(keys_client):
+    kek = _create_kek(keys_client, unique("kek"))
+    with pytest.raises(HttpResponseError) as error:
+        keys_client.import_key(
+            unique("byok-aes"),
+            JsonWebKey(kty=KeyType.oct_hsm, t=_transfer_blob(kek, os.urandom(32))),
+        )
+    assert error.value.status_code == 400
+    keys_client.begin_delete_key(kek.name).result()

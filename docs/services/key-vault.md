@@ -30,6 +30,8 @@ Self-signed certificate issuance also supports the Key Vault Certificates SDK.
 - **Crypto ops**: `encrypt`/`decrypt` (RSA-OAEP, RSA-OAEP-256, RSA1_5; AES-GCM A128/A192/A256),
   `sign`/`verify` (RS256/384/512, PS256/384/512, ES256/384/512), `wrapkey`/`unwrapkey`
 - **`/rng`**: random bytes for client-side key material (see deviations)
+- **Bring your own key (BYOK)**: import an `RSA-HSM`, `EC-HSM` or `oct-HSM` key from a `key_hsm` transfer
+  blob protected by a key exchange key (see [Bring your own key](#bring-your-own-key))
 - **Managed HSM**: the same data plane served under the `/{account}-managedhsm/` suffix
 
 ### Certificates
@@ -335,7 +337,7 @@ All endpoints sit under `/{accountName}-keyvault/` with an `api-version` query p
 | Method | Path | Description |
 |---|---|---|
 | `POST` | `/keys/{name}/create` | Create a key (`kty`, `key_size`, `curve`, `key_ops`) |
-| `PUT` | `/keys/{name}` | Import a key (`key` JWK) |
+| `PUT` | `/keys/{name}` | Import a key (`key` JWK, or a `key_hsm` transfer blob for BYOK) |
 | `GET` | `/keys` | List keys |
 | `GET` | `/keys/{name}` | Get latest version |
 | `GET` | `/keys/{name}/{version}` | Get a specific version |
@@ -370,6 +372,43 @@ All endpoints sit under `/{accountName}-keyvault/` with an `api-version` query p
 
 ---
 
+## Bring your own key
+
+floci-az accepts the key transfer blob of the
+[Azure Key Vault BYOK specification](https://learn.microsoft.com/azure/key-vault/keys/byok-specification), the
+`.byok` file an HSM vendor's BYOK tool produces and `az keyvault key import --byok-file` sends:
+
+1. Create a key exchange key (KEK) in the vault or Managed HSM you import into: an `RSA-HSM` key of 2048, 3072
+   or 4096 bits with `key_ops` of `["import"]`, for example
+   `az keyvault key create --kty RSA-HSM --size 4096 --ops import --name KEKforBYOK --vault-name <vault>`.
+2. Wrap the target key with the KEK's public key using `CKM_RSA_AES_KEY_WRAP`: an ephemeral AES key encrypted
+   with RSA-OAEP (SHA-1), followed by the target key encrypted with that AES key using AES Key Wrap with Padding
+   (RFC 5649). The target key is PKCS#8 DER for RSA and EC, and raw bytes for an AES key.
+3. `PUT /keys/{name}` with `kty` set to `RSA-HSM`, `EC-HSM` (with `crv`) or `oct-HSM`, and `key_hsm` set to the
+   base64url-encoded blob:
+
+```json
+{
+  "schema_version": "1.0.0",
+  "header": { "kid": "https://<vault>.vault.azure.net/keys/KEKforBYOK/<version>", "alg": "dir", "enc": "CKM_RSA_AES_KEY_WRAP" },
+  "ciphertext": "<base64url ciphertext>",
+  "generator": "BYOK tool name and version"
+}
+```
+
+The SDKs send the blob as `JsonWebKey.t`, which they serialize as `key_hsm`. The imported key behaves like any
+other key: its public JWK is returned, it keeps the `key_ops` from the request, and it serves crypto operations.
+
+The import is refused with `400 BadParameter` when:
+
+- `kty` is not `RSA-HSM`, `EC-HSM` or `oct-HSM`, or is `oct-HSM` on a vault rather than a Managed HSM
+- the blob's `alg` is not `dir` or its `enc` is not `CKM_RSA_AES_KEY_WRAP`
+- the KEK is not an `RSA-HSM` key with the `import` operation
+- the ciphertext does not decrypt with the KEK, or the target key does not match `kty` or `crv`
+
+A KEK that does not exist in this vault answers `404 KeyNotFound`, and a disabled, expired or not-yet-valid
+KEK `403 Forbidden`, as they do for crypto operations.
+
 ## Intentional deviations
 
 These are deliberate differences from real Azure Key Vault. They are stable, documented behavior, not bugs:
@@ -380,6 +419,8 @@ These are deliberate differences from real Azure Key Vault. They are stable, doc
 - **`/rng` caps at 128 bytes per request.** This matches real Azure (which caps at 128). An earlier draft of the
   plan stated 1024; that was incorrect.
 - **Key material is stored in the clear in the storage backend** (memory/persistent), not HSM-encrypted.
+  This includes keys imported through BYOK: the transfer blob is unwrapped on import and the key stored like
+  any other.
 - **`key_size` may appear in the returned public JWK** even though it is not part of Azure's `JsonWebKey`
   schema. Azure SDKs tolerate unknown fields; kept for convenience.
 - **`nbf`/`exp` must be numeric Unix epoch timestamps.** Whitespace is tolerated and normalized; any other
